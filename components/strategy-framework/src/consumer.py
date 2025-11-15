@@ -3,6 +3,9 @@ import asyncio
 import logging
 import json
 from typing import Dict, Any
+from datetime import datetime, timezone
+import urllib.request
+import urllib.error
 import grpc
 from confluent_kafka import Consumer, KafkaError
 from dotenv import load_dotenv
@@ -60,6 +63,8 @@ FRAMEWORK_KAFKA_CHECK_ATTEMPTS = int(os.getenv("FRAMEWORK_KAFKA_CHECK_ATTEMPTS",
 FRAMEWORK_KAFKA_CHECK_BACKOFF_MS = int(os.getenv("FRAMEWORK_KAFKA_CHECK_BACKOFF_MS", "5000"))
 REDIS_URL = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0")
 STRATEGY_CONFIG_PREFIX = os.getenv("STRATEGY_CONFIG_KEY_PREFIX", "control:strategy:")
+CONTROL_CENTER_API_URL = os.getenv("CONTROL_CENTER_API_URL", "").rstrip("/")
+CONTROL_CENTER_INTERNAL_TOKEN = os.getenv("CONTROL_CENTER_INTERNAL_TOKEN", "")
 
 # --- Métricas ---
 TRADES_PROCESSED = Counter("strategy_trades_processed_total", "Total de trades processados", ["symbol"])
@@ -488,6 +493,9 @@ async def run_market_data_consumer(
                         SIGNAL_VALIDATION_RESULT.labels(strategy_id=strategy_id, status="approved").inc()
                         client_order_id = validation_response.order_request.client_order_id
                         log.warning("SINAL APROVADO (%s): %s", strategy_id, client_order_id)
+                        asyncio.create_task(
+                            report_operation_to_control_center(validation_response.order_request, signal)
+                        )
                     else:
                         SIGNAL_VALIDATION_RESULT.labels(strategy_id=strategy_id, status="rejected").inc()
                         log.warning("SINAL REJEITADO (%s): %s", strategy_id, validation_response.reason)
@@ -662,3 +670,50 @@ async def wait_for_kafka_topic(consumer: Consumer, topic: str, attempts: int, ba
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+
+async def report_operation_to_control_center(
+    order_request: actions_pb2.OrderRequest | None, signal: actions_pb2.TradingSignal
+) -> None:
+    if not CONTROL_CENTER_API_URL or not CONTROL_CENTER_INTERNAL_TOKEN:
+        return
+    if order_request is None:
+        return
+    mode_name = actions_pb2.TradingMode.Name(signal.mode)
+    payload = {
+        "client_order_id": order_request.client_order_id,
+        "symbol": order_request.symbol,
+        "side": order_request.side,
+        "order_type": order_request.order_type,
+        "quantity": order_request.quantity,
+        "price": order_request.price,
+        "status": "FILLED",
+        "fee": "0",
+        "mode": mode_name,
+        "strategy_id": signal.strategy_id,
+        "executed_at": datetime.now(timezone.utc).isoformat(),
+    }
+    await _post_internal_event("/internal/v1/operations", payload)
+
+
+async def _post_internal_event(path: str, payload: dict) -> None:
+    url = f"{CONTROL_CENTER_API_URL.rstrip('/')}{path}"
+    data = json.dumps(payload).encode("utf-8")
+
+    def _send() -> None:
+        req = urllib.request.Request(
+            url,
+            data=data,
+            headers={
+                "Content-Type": "application/json",
+                "X-Internal-Token": CONTROL_CENTER_INTERNAL_TOKEN,
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10):
+            pass
+
+    try:
+        await asyncio.to_thread(_send)
+    except urllib.error.URLError as err:
+        log.debug("Falha ao enviar operação para Control Center: %s", err)

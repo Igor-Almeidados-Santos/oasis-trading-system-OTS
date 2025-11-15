@@ -1,13 +1,23 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha256"
+	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"sort"
 	"strconv"
@@ -100,6 +110,27 @@ type Operation struct {
 	ExecutedAt    time.Time `json:"executed_at"`
 	Fee           string    `json:"fee"`
 	Mode          string    `json:"mode"`
+	StrategyID    string    `json:"strategy_id,omitempty"`
+}
+
+func ensurePaperOperationsTable(ctx context.Context, pool *pgxpool.Pool) error {
+	const ddl = `
+CREATE TABLE IF NOT EXISTS paper_operations (
+    id BIGSERIAL PRIMARY KEY,
+    client_order_id TEXT,
+    symbol TEXT,
+    side TEXT,
+    order_type TEXT,
+    quantity TEXT,
+    price TEXT,
+    status TEXT,
+    executed_at TIMESTAMPTZ DEFAULT NOW(),
+    fee TEXT,
+    mode TEXT DEFAULT 'PAPER',
+    strategy_id TEXT
+);`
+	_, err := pool.Exec(ctx, ddl)
+	return err
 }
 
 type PortfolioResponse struct {
@@ -111,6 +142,12 @@ type PortfolioResponse struct {
 type LoginRequest struct {
 	Username string `json:"username" binding:"required"`
 	Password string `json:"password" binding:"required"`
+}
+
+type RegisterRequest struct {
+	Username string `json:"username" binding:"required,min=3,max=64"`
+	Email    string `json:"email" binding:"required,email"`
+	Password string `json:"password" binding:"required,min=6"`
 }
 
 type ControlCommand struct {
@@ -366,9 +403,363 @@ func (h *ApiHandler) saveStrategyConfig(ctx context.Context, cfg StrategyConfig)
 
 // Estrutura para injetar dependências
 type ApiHandler struct {
-	redisClient *redis.Client
-	dbPool      *pgxpool.Pool
-	kafkaWriter *kafka.Writer
+	redisClient   *redis.Client
+	dbPool        *pgxpool.Pool
+	kafkaWriter   *kafka.Writer
+	firebase      *firebaseClient
+	internalToken string
+}
+
+type firebaseClient struct {
+	projectID      string
+	clientEmail    string
+	privateKey     *rsa.PrivateKey
+	httpClient     *http.Client
+	operationsColl string
+	configsColl    string
+	usersColl      string
+	token          string
+	tokenExpiry    time.Time
+}
+
+type firestoreDocument struct {
+	Fields map[string]firestoreValue `json:"fields"`
+}
+
+type firestoreValue struct {
+	StringValue    string `json:"stringValue,omitempty"`
+	TimestampValue string `json:"timestampValue,omitempty"`
+}
+
+func newFirebaseClientFromEnv() (*firebaseClient, error) {
+	projectID := strings.TrimSpace(os.Getenv("FIREBASE_PROJECT_ID"))
+	clientEmail := strings.TrimSpace(os.Getenv("FIREBASE_CLIENT_EMAIL"))
+	privateKey := os.Getenv("FIREBASE_PRIVATE_KEY")
+	if projectID == "" || clientEmail == "" || privateKey == "" {
+		return nil, nil
+	}
+	privateKey = strings.ReplaceAll(privateKey, "\\n", "\n")
+	block, _ := pem.Decode([]byte(privateKey))
+	if block == nil {
+		return nil, fmt.Errorf("falha ao decodificar chave privada")
+	}
+	parsed, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+	if err != nil {
+		return nil, err
+	}
+	rsaKey, ok := parsed.(*rsa.PrivateKey)
+	if !ok {
+		return nil, fmt.Errorf("chave privada inválida")
+	}
+	return &firebaseClient{
+		projectID:      projectID,
+		clientEmail:    clientEmail,
+		privateKey:     rsaKey,
+		httpClient:     &http.Client{Timeout: 10 * time.Second},
+		operationsColl: defaultValue(strings.TrimSpace(os.Getenv("FIREBASE_COLLECTION_REAL_OPERATIONS")), "real_operations"),
+		configsColl:    defaultValue(strings.TrimSpace(os.Getenv("FIREBASE_COLLECTION_REAL_CONFIGS")), "strategy_configs"),
+		usersColl:      defaultValue(strings.TrimSpace(os.Getenv("FIREBASE_COLLECTION_USERS")), "users"),
+	}, nil
+}
+
+func (fc *firebaseClient) firestoreURL(collection string) string {
+	return fmt.Sprintf("https://firestore.googleapis.com/v1/projects/%s/databases/(default)/documents/%s", fc.projectID, collection)
+}
+
+func (fc *firebaseClient) getAccessToken(ctx context.Context) (string, error) {
+	if fc.token != "" && time.Now().Add(2*time.Minute).Before(fc.tokenExpiry) {
+		return fc.token, nil
+	}
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"RS256","typ":"JWT"}`))
+	now := time.Now()
+	claims := map[string]interface{}{
+		"iss":   fc.clientEmail,
+		"scope": "https://www.googleapis.com/auth/datastore",
+		"aud":   "https://oauth2.googleapis.com/token",
+		"exp":   now.Add(time.Hour).Unix(),
+		"iat":   now.Unix(),
+	}
+	claimsJSON, _ := json.Marshal(claims)
+	payload := base64.RawURLEncoding.EncodeToString(claimsJSON)
+	toSign := header + "." + payload
+	hash := sha256.Sum256([]byte(toSign))
+	sig, err := rsa.SignPKCS1v15(rand.Reader, fc.privateKey, crypto.SHA256, hash[:])
+	if err != nil {
+		return "", err
+	}
+	jwt := toSign + "." + base64.RawURLEncoding.EncodeToString(sig)
+
+	form := url.Values{}
+	form.Set("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer")
+	form.Set("assertion", jwt)
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, "https://oauth2.googleapis.com/token", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err := fc.httpClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	if resp.StatusCode >= 300 {
+		return "", fmt.Errorf("oauth token error %d: %s", resp.StatusCode, string(body))
+	}
+	var tokenResp struct {
+		AccessToken string `json:"access_token"`
+		ExpiresIn   int64  `json:"expires_in"`
+	}
+	if err := json.Unmarshal(body, &tokenResp); err != nil {
+		return "", err
+	}
+	fc.token = tokenResp.AccessToken
+	fc.tokenExpiry = time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second)
+	return fc.token, nil
+}
+
+func (fc *firebaseClient) insertDocument(ctx context.Context, collection string, doc firestoreDocument) error {
+	if fc == nil {
+		return fmt.Errorf("firebase não configurado")
+	}
+	token, err := fc.getAccessToken(ctx)
+	if err != nil {
+		return err
+	}
+	body, _ := json.Marshal(doc)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fc.firestoreURL(collection), bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := fc.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("firestore insert %d: %s", resp.StatusCode, string(respBody))
+	}
+	return nil
+}
+
+func (fc *firebaseClient) runQuery(
+	ctx context.Context,
+	collection string,
+	filterField string,
+	filterValue string,
+	orderField string,
+	desc bool,
+	limit int,
+) ([]map[string]firestoreValue, error) {
+	if fc == nil {
+		return []map[string]firestoreValue{}, nil
+	}
+	token, err := fc.getAccessToken(ctx)
+	if err != nil {
+		return nil, err
+	}
+	structuredQuery := map[string]interface{}{
+		"from": []map[string]interface{}{
+			{"collectionId": collection},
+		},
+	}
+	if filterField != "" && filterValue != "" {
+		structuredQuery["where"] = map[string]interface{}{
+			"fieldFilter": map[string]interface{}{
+				"field": map[string]interface{}{"fieldPath": filterField},
+				"op":    "EQUAL",
+				"value": map[string]interface{}{"stringValue": filterValue},
+			},
+		}
+	}
+	if orderField != "" {
+		direction := "DESCENDING"
+		if !desc {
+			direction = "ASCENDING"
+		}
+		structuredQuery["orderBy"] = []map[string]interface{}{
+			{
+				"field":     map[string]interface{}{"fieldPath": orderField},
+				"direction": direction,
+			},
+		}
+	}
+	if limit > 0 {
+		structuredQuery["limit"] = limit
+	}
+	payload := map[string]interface{}{
+		"structuredQuery": structuredQuery,
+	}
+	body, _ := json.Marshal(payload)
+	runQueryURL := fmt.Sprintf("https://firestore.googleapis.com/v1/projects/%s/databases/(default)/documents:runQuery", fc.projectID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, runQueryURL, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := fc.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("firestore query %d: %s", resp.StatusCode, string(respBody))
+	}
+	var rawResults []struct {
+		Document struct {
+			Fields map[string]firestoreValue `json:"fields"`
+		} `json:"document"`
+	}
+	if err := json.Unmarshal(respBody, &rawResults); err != nil {
+		return nil, err
+	}
+	var docs []map[string]firestoreValue
+	for _, result := range rawResults {
+		if result.Document.Fields != nil {
+			docs = append(docs, result.Document.Fields)
+		}
+	}
+	return docs, nil
+}
+
+func fsString(v string) firestoreValue {
+	return firestoreValue{StringValue: v}
+}
+
+func fsTimestamp(t time.Time) firestoreValue {
+	return firestoreValue{TimestampValue: t.UTC().Format(time.RFC3339Nano)}
+}
+
+func defaultValue(value, fallback string) string {
+	if value == "" {
+		return fallback
+	}
+	return value
+}
+
+func (fc *firebaseClient) operationsCollection() string {
+	return defaultValue(fc.operationsColl, "real_operations")
+}
+
+func (fc *firebaseClient) configsCollection() string {
+	return defaultValue(fc.configsColl, "strategy_configs")
+}
+
+func (fc *firebaseClient) usersCollection() string {
+	return defaultValue(fc.usersColl, "users")
+}
+
+func (h *ApiHandler) fetchRealOperations(ctx context.Context, limit int) ([]Operation, error) {
+	if h.firebase == nil {
+		return []Operation{}, nil
+	}
+	if limit <= 0 {
+		limit = 100
+	}
+	docs, err := h.firebase.runQuery(ctx, h.firebase.operationsCollection(), "", "", "executed_at", true, limit)
+	if err != nil {
+		return nil, err
+	}
+	var operations []Operation
+	for _, fields := range docs {
+		op := Operation{
+			ClientOrderID: fields["client_order_id"].StringValue,
+			Symbol:        fields["symbol"].StringValue,
+			Side:          fields["side"].StringValue,
+			OrderType:     fields["order_type"].StringValue,
+			Quantity:      fields["quantity"].StringValue,
+			Price:         fields["price"].StringValue,
+			Status:        fields["status"].StringValue,
+			Fee:           fields["fee"].StringValue,
+			Mode:          "REAL",
+			StrategyID:    fields["strategy_id"].StringValue,
+		}
+		if ts := fields["executed_at"].TimestampValue; ts != "" {
+			if parsed, err := time.Parse(time.RFC3339, ts); err == nil {
+				op.ExecutedAt = parsed
+			} else {
+				op.ExecutedAt = time.Now().UTC()
+			}
+		} else {
+			op.ExecutedAt = time.Now().UTC()
+		}
+		operations = append(operations, op)
+	}
+	return operations, nil
+}
+
+func (h *ApiHandler) persistRealOperation(ctx context.Context, op Operation) error {
+	if h.firebase == nil {
+		return fmt.Errorf("firebase não configurado")
+	}
+	doc := firestoreDocument{
+		Fields: map[string]firestoreValue{
+			"client_order_id": fsString(op.ClientOrderID),
+			"symbol":          fsString(op.Symbol),
+			"side":            fsString(op.Side),
+			"order_type":      fsString(op.OrderType),
+			"quantity":        fsString(op.Quantity),
+			"price":           fsString(op.Price),
+			"status":          fsString(op.Status),
+			"executed_at":     fsTimestamp(op.ExecutedAt),
+			"fee":             fsString(op.Fee),
+			"mode":            fsString(op.Mode),
+			"strategy_id":     fsString(op.StrategyID),
+		},
+	}
+	return h.firebase.insertDocument(ctx, h.firebase.operationsCollection(), doc)
+}
+
+func (h *ApiHandler) persistRealConfig(ctx context.Context, cfg StrategyConfig) {
+	if h.firebase == nil {
+		return
+	}
+	fields := map[string]firestoreValue{
+		"strategy_id":       fsString(cfg.StrategyID),
+		"enabled":           fsString(strconv.FormatBool(cfg.Enabled)),
+		"mode":              fsString(cfg.Mode),
+		"usd_balance":       fsString(cfg.UsdBalance),
+		"take_profit_bps":   fsString(strconv.Itoa(cfg.TakeProfitBps)),
+		"stop_loss_bps":     fsString(strconv.Itoa(cfg.StopLossBps)),
+		"fast_window":       fsString(strconv.Itoa(cfg.FastWindow)),
+		"slow_window":       fsString(strconv.Itoa(cfg.SlowWindow)),
+		"min_signal_bps":    fsString(strconv.Itoa(cfg.MinSignalBps)),
+		"position_size_pct": fsString(fmt.Sprintf("%f", cfg.PositionSizePct)),
+		"cooldown_seconds":  fsString(fmt.Sprintf("%f", cfg.CooldownSeconds)),
+		"batch_size":        fsString(strconv.Itoa(cfg.BatchSize)),
+		"batch_interval_m":  fsString(fmt.Sprintf("%f", cfg.BatchIntervalM)),
+		"updated_at":        fsTimestamp(time.Now().UTC()),
+	}
+	if len(cfg.Symbols) > 0 {
+		fields["symbols"] = fsString(strings.Join(cfg.Symbols, ","))
+	}
+	doc := firestoreDocument{Fields: fields}
+	if err := h.firebase.insertDocument(ctx, h.firebase.configsCollection(), doc); err != nil {
+		log.Printf("Aviso: falha ao gravar config real no Firebase: %v", err)
+	}
+}
+
+func asString(val interface{}) string {
+	switch v := val.(type) {
+	case string:
+		return v
+	case fmt.Stringer:
+		return v.String()
+	case float64:
+		return strconv.FormatFloat(v, 'f', -1, 64)
+	case json.Number:
+		return v.String()
+	default:
+		return ""
+	}
 }
 
 type jwtClaims struct {
@@ -484,6 +875,11 @@ func main() {
 	if err != nil {
 		log.Printf("Atenção: Falha ao conectar ao PostgreSQL (%v). Endpoints dependentes ficarão indisponíveis.", err)
 	}
+	if dbPool != nil {
+		if err := ensurePaperOperationsTable(context.Background(), dbPool); err != nil {
+			log.Printf("Aviso: não foi possível garantir tabela paper_operations: %v", err)
+		}
+	}
 
 	kafkaBrokers := os.Getenv("KAFKA_BROKERS")
 	if kafkaBrokers == "" {
@@ -514,6 +910,17 @@ func main() {
 		redisClient: rdb,
 		dbPool:      dbPool,
 		kafkaWriter: kafkaWriter,
+	}
+	internalToken := os.Getenv("CONTROL_CENTER_INTERNAL_TOKEN")
+	if internalToken == "" {
+		internalToken = "dev-internal-token"
+	}
+	handler.internalToken = internalToken
+
+	if fbClient, err := newFirebaseClientFromEnv(); err != nil {
+		log.Printf("Aviso: falha ao configurar Firebase: %v", err)
+	} else {
+		handler.firebase = fbClient
 	}
 
 	defer func() {
@@ -552,12 +959,22 @@ func main() {
 			return
 		}
 
-		if req.Username != placeholderUser {
+		if handler.firebase != nil {
+			if handler.authenticateFirebaseUser(c.Request.Context(), req.Username, req.Password) {
+				token, err := generateJWT(req.Username)
+				if err != nil {
+					log.Printf("Erro ao gerar token JWT: %v", err)
+					c.JSON(http.StatusInternalServerError, gin.H{"error": "falha ao gerar token"})
+					return
+				}
+				c.JSON(http.StatusOK, gin.H{"token": token})
+				return
+			}
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "credenciais inválidas"})
 			return
 		}
 
-		if err := bcrypt.CompareHashAndPassword(placeholderPasswordHash, []byte(req.Password)); err != nil {
+		if req.Username != placeholderUser || bcrypt.CompareHashAndPassword(placeholderPasswordHash, []byte(req.Password)) != nil {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "credenciais inválidas"})
 			return
 		}
@@ -572,6 +989,8 @@ func main() {
 		c.JSON(http.StatusOK, gin.H{"token": token})
 	})
 
+	router.POST("/api/v1/auth/register", handler.registerUser)
+
 	apiV1 := router.Group("/api/v1")
 	apiV1.Use(authMiddleware())
 	{
@@ -581,6 +1000,11 @@ func main() {
 		apiV1.POST("/bot/status", handler.setBotStatus)
 		apiV1.POST("/strategies/:strategy_id/toggle", handler.setStrategyConfig)
 		apiV1.POST("/paper/reset", handler.resetPaperEnvironment)
+	}
+
+	internal := router.Group("/internal/v1")
+	{
+		internal.POST("/operations", handler.recordOperation)
 	}
 
 	port := os.Getenv("CONTROL_CENTER_API_PORT")
@@ -740,19 +1164,35 @@ func (h *ApiHandler) resetPaperEnvironment(c *gin.Context) {
 			log.Printf("Erro ao limpar ordens paper: %v", err)
 		}
 	}
+	truncatePaperOperations(ctx, h.dbPool)
 
 	c.JSON(http.StatusOK, gin.H{"message": "Ambiente paper reinicializado"})
 }
 
 func (h *ApiHandler) getOperations(c *gin.Context) {
 	if h.dbPool == nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "serviço de operações indisponível"})
+		c.JSON(http.StatusOK, []Operation{})
 		return
 	}
 
 	ctx := context.Background()
-	modeFilter := c.DefaultQuery("mode", "ALL")
-	limit := c.DefaultQuery("limit", "100")
+	modeFilter := strings.ToUpper(c.DefaultQuery("mode", "ALL"))
+	limitStr := c.DefaultQuery("limit", "100")
+	limit, err := strconv.Atoi(limitStr)
+	if err != nil || limit <= 0 {
+		limit = 100
+	}
+
+	if modeFilter == "REAL" {
+		realOps, err := h.fetchRealOperations(ctx, limit)
+		if err != nil {
+			log.Printf("Erro ao consultar operações reais (Firebase): %v", err)
+			c.JSON(http.StatusOK, []Operation{})
+			return
+		}
+		c.JSON(http.StatusOK, realOps)
+		return
+	}
 
 	query := `
         WITH combined AS (
@@ -802,7 +1242,8 @@ func (h *ApiHandler) getOperations(c *gin.Context) {
             status,
             executed_at,
             fee,
-            mode
+            mode,
+            '' AS strategy_id
         FROM combined
         ORDER BY order_ts DESC NULLS LAST
         LIMIT $2`
@@ -810,7 +1251,18 @@ func (h *ApiHandler) getOperations(c *gin.Context) {
 	rows, err := h.dbPool.Query(ctx, query, modeFilter, limit)
 	if err != nil {
 		log.Printf("Erro ao consultar operações: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Erro ao buscar operações"})
+		paperOps, err := fetchPaperOperations(ctx, h.dbPool, limit)
+		if err != nil {
+			log.Printf("Erro ao recuperar operações locais: %v", err)
+			c.JSON(http.StatusOK, []Operation{})
+			return
+		}
+		if modeFilter == "ALL" {
+			realOps, _ := h.fetchRealOperations(ctx, limit)
+			c.JSON(http.StatusOK, append(paperOps, realOps...))
+		} else {
+			c.JSON(http.StatusOK, paperOps)
+		}
 		return
 	}
 	defer rows.Close()
@@ -830,6 +1282,7 @@ func (h *ApiHandler) getOperations(c *gin.Context) {
 			&op.ExecutedAt,
 			&op.Fee,
 			&op.Mode,
+			&op.StrategyID,
 		); err != nil {
 			log.Printf("Erro ao scanear linha de operação: %v", err)
 			continue
@@ -841,7 +1294,228 @@ func (h *ApiHandler) getOperations(c *gin.Context) {
 		log.Printf("Erro após iterar linhas de operações: %v", err)
 	}
 
+	if modeFilter == "ALL" {
+		realOps, _ := h.fetchRealOperations(ctx, limit)
+		operations = append(operations, realOps...)
+	}
 	c.JSON(http.StatusOK, operations)
+}
+
+func (h *ApiHandler) recordOperation(c *gin.Context) {
+	if h.internalToken != "" {
+		if c.GetHeader("X-Internal-Token") != h.internalToken {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+			return
+		}
+	}
+	var payload Operation
+	if err := c.ShouldBindJSON(&payload); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "payload inválido"})
+		return
+	}
+	if payload.ExecutedAt.IsZero() {
+		payload.ExecutedAt = time.Now().UTC()
+	}
+	if payload.Fee == "" {
+		payload.Fee = "0"
+	}
+	if payload.Price == "" {
+		payload.Price = "0"
+	}
+	if payload.Quantity == "" {
+		payload.Quantity = "0"
+	}
+	payload.Mode = strings.ToUpper(payload.Mode)
+	ctx := context.Background()
+	if payload.Mode == "REAL" {
+		if err := h.persistRealOperation(ctx, payload); err != nil {
+			log.Printf("Erro ao gravar operação real: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Falha ao gravar operação real"})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"status": "ok"})
+		return
+	}
+	if h.dbPool == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Postgres indisponível"})
+		return
+	}
+	if err := insertPaperOperation(ctx, h.dbPool, payload); err != nil {
+		log.Printf("Erro ao gravar operação paper: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Falha ao gravar operação paper"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+}
+
+func fetchPaperOperations(ctx context.Context, pool *pgxpool.Pool, limit int) ([]Operation, error) {
+	if pool == nil {
+		return nil, fmt.Errorf("pool indisponível")
+	}
+	const query = `
+        SELECT
+            id,
+            client_order_id,
+            symbol,
+            side,
+            order_type,
+            quantity,
+            price,
+            status,
+            executed_at,
+            COALESCE(fee, '0') AS fee,
+            mode,
+            COALESCE(strategy_id, '') AS strategy_id
+        FROM paper_operations
+        ORDER BY executed_at DESC
+        LIMIT $1`
+	rows, err := pool.Query(ctx, query, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ops []Operation
+	for rows.Next() {
+		var op Operation
+		if err := rows.Scan(
+			&op.ID,
+			&op.ClientOrderID,
+			&op.Symbol,
+			&op.Side,
+			&op.OrderType,
+			&op.Quantity,
+			&op.Price,
+			&op.Status,
+			&op.ExecutedAt,
+			&op.Fee,
+			&op.Mode,
+			&op.StrategyID,
+		); err != nil {
+			continue
+		}
+		ops = append(ops, op)
+	}
+	return ops, rows.Err()
+}
+
+func insertPaperOperation(ctx context.Context, pool *pgxpool.Pool, op Operation) error {
+	if pool == nil {
+		return fmt.Errorf("pool indisponível")
+	}
+	const insertStmt = `
+        INSERT INTO paper_operations
+        (client_order_id, symbol, side, order_type, quantity, price, status, executed_at, fee, mode, strategy_id)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`
+	_, err := pool.Exec(
+		ctx,
+		insertStmt,
+		op.ClientOrderID,
+		op.Symbol,
+		op.Side,
+		op.OrderType,
+		op.Quantity,
+		op.Price,
+		op.Status,
+		op.ExecutedAt,
+		op.Fee,
+		op.Mode,
+		op.StrategyID,
+	)
+	return err
+}
+
+func truncatePaperOperations(ctx context.Context, pool *pgxpool.Pool) {
+	if pool == nil {
+		return
+	}
+	if _, err := pool.Exec(ctx, "TRUNCATE paper_operations RESTART IDENTITY"); err != nil {
+		log.Printf("Erro ao limpar paper_operations: %v", err)
+	}
+}
+
+func (h *ApiHandler) authenticateFirebaseUser(ctx context.Context, username, password string) bool {
+	if h.firebase == nil {
+		return false
+	}
+	doc, err := h.fetchUserDocument(ctx, username)
+	if err != nil || doc == nil {
+		return false
+	}
+	hashed := doc["password"].StringValue
+	if hashed == "" {
+		return false
+	}
+	return bcrypt.CompareHashAndPassword([]byte(hashed), []byte(password)) == nil
+}
+
+func (h *ApiHandler) fetchUserDocument(ctx context.Context, username string) (map[string]firestoreValue, error) {
+	if h.firebase == nil {
+		return nil, fmt.Errorf("firebase não configurado")
+	}
+	docs, err := h.firebase.runQuery(ctx, h.firebase.usersCollection(), "username", strings.ToLower(username), "", false, 1)
+	if err != nil {
+		return nil, err
+	}
+	if len(docs) == 0 {
+		return nil, nil
+	}
+	return docs[0], nil
+}
+
+func (h *ApiHandler) fetchUserByEmail(ctx context.Context, email string) (map[string]firestoreValue, error) {
+	if h.firebase == nil {
+		return nil, fmt.Errorf("firebase não configurado")
+	}
+	docs, err := h.firebase.runQuery(ctx, h.firebase.usersCollection(), "email", strings.ToLower(email), "", false, 1)
+	if err != nil {
+		return nil, err
+	}
+	if len(docs) == 0 {
+		return nil, nil
+	}
+	return docs[0], nil
+}
+
+func (h *ApiHandler) registerUser(c *gin.Context) {
+	if h.firebase == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Cadastro desativado"})
+		return
+	}
+	var req RegisterRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Dados inválidos"})
+		return
+	}
+	ctx := c.Request.Context()
+	if existing, _ := h.fetchUserDocument(ctx, req.Username); existing != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": "Usuário já existe"})
+		return
+	}
+	if existingEmail, _ := h.fetchUserByEmail(ctx, req.Email); existingEmail != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": "Email já registado"})
+		return
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Falha ao proteger senha"})
+		return
+	}
+	doc := firestoreDocument{
+		Fields: map[string]firestoreValue{
+			"username":      fsString(strings.ToLower(req.Username)),
+			"display":       fsString(req.Username),
+			"email":         fsString(strings.ToLower(req.Email)),
+			"display_email": fsString(req.Email),
+			"password":      fsString(string(hash)),
+			"created_at":    fsTimestamp(time.Now().UTC()),
+		},
+	}
+	if err := h.firebase.insertDocument(ctx, h.firebase.usersCollection(), doc); err != nil {
+		log.Printf("Erro ao registrar usuário: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Falha ao registrar"})
+		return
+	}
+	c.JSON(http.StatusCreated, gin.H{"message": "Usuário criado"})
 }
 
 func (h *ApiHandler) setBotStatus(c *gin.Context) {
@@ -1046,6 +1720,10 @@ func (h *ApiHandler) setStrategyConfig(c *gin.Context) {
 		if err := h.redisClient.Set(ctx, walletKey, cfg.UsdBalance, 0).Err(); err != nil {
 			log.Printf("Aviso: não foi possível atualizar saldo %s: %v", walletKey, err)
 		}
+	}
+
+	if cfg.Mode == "REAL" {
+		h.persistRealConfig(ctx, cfg)
 	}
 
 	c.JSON(http.StatusAccepted, gin.H{
