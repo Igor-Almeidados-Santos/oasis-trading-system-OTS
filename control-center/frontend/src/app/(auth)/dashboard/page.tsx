@@ -1,6 +1,7 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
 import { MetricsSection } from "../../../components/dashboard/MetricsSection";
 import { OperationsSection } from "../../../components/dashboard/OperationsSection";
 import { PortfolioSection } from "../../../components/dashboard/PortfolioSection";
@@ -21,6 +22,7 @@ import {
   fetchControlState,
   fetchOperations,
   fetchPortfolio,
+  liquidatePaperPortfolio,
   normalizePortfolioSnapshot,
   resetPaperEnvironment,
   setBotStatus,
@@ -55,6 +57,12 @@ type CommandHistoryRecord = {
 type SimulationActionResult = {
   success: boolean;
   strategy?: StrategyState;
+  errorMessage?: string;
+};
+
+type SimulationUtilityResult = {
+  success: boolean;
+  message?: string;
   errorMessage?: string;
 };
 
@@ -142,6 +150,7 @@ function mapPortfolioToPaperSnapshot(
 }
 
 export default function DashboardPage() {
+  const router = useRouter();
   const [portfolio, setPortfolio] = useState<PortfolioSnapshot>({
     positions: [],
     cash: {},
@@ -156,8 +165,49 @@ export default function DashboardPage() {
   const [commandLoading, setCommandLoading] = useState(false);
   const [loading, setLoading] = useState(true);
   const [username, setUsername] = useState("Trader");
+  const [profileMenuOpen, setProfileMenuOpen] = useState(false);
   const [selectedStrategy, setSelectedStrategy] =
     useState<string>("momentum-001");
+  const [activeView, setActiveView] = useState<DashboardView>("dashboard");
+  const profileMenuRef = useRef<HTMLDivElement | null>(null);
+  const profileInitials = useMemo(() => {
+    const trimmed = (username || "").trim();
+    if (!trimmed) {
+      return "US";
+    }
+    const parts = trimmed.split(/\s+/).filter(Boolean);
+    const first = parts[0]?.charAt(0) ?? trimmed.charAt(0);
+    const second = parts[1]?.charAt(0) ?? trimmed.charAt(1) ?? "";
+    return `${first}${second}`.toUpperCase();
+  }, [username]);
+
+  useEffect(() => {
+    const handler = (event: MouseEvent) => {
+      if (
+        profileMenuRef.current &&
+        event.target instanceof Node &&
+        !profileMenuRef.current.contains(event.target)
+      ) {
+        setProfileMenuOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", handler);
+    return () => {
+      document.removeEventListener("mousedown", handler);
+    };
+  }, [profileMenuRef]);
+
+  const handleProfileSettingsClick = useCallback(() => {
+    setActiveView("settings");
+    setProfileMenuOpen(false);
+  }, []);
+
+  const handleLogout = useCallback(() => {
+    localStorage.removeItem("accessToken");
+    localStorage.removeItem("username");
+    setProfileMenuOpen(false);
+    router.replace("/login");
+  }, [router]);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [darkMode, setDarkMode] = useState(false);
   const [operationsModeFilter, setOperationsModeFilter] =
@@ -184,7 +234,6 @@ export default function DashboardPage() {
   const [operationSearch, setOperationSearch] = useState("");
   const [operationSortKey, setOperationSortKey] = useState<OperationSortKey>("executed_at");
   const [operationSortDir, setOperationSortDir] = useState<"asc" | "desc">("desc");
-  const [activeView, setActiveView] = useState<DashboardView>("dashboard");
   const [commandHistory, setCommandHistory] = useState<CommandHistoryRecord[]>([]);
   const [simulationStrategies, setSimulationStrategies] = useState<StrategyState[]>([]);
   const [simulationControlLoading, setSimulationControlLoading] = useState(false);
@@ -251,7 +300,10 @@ export default function DashboardPage() {
     try {
       setSimulationControlLoading(true);
       const control = await fetchControlState(token);
-      setSimulationStrategies(control.strategies ?? []);
+      const paperEnabled = (control.strategies ?? []).filter(
+        (strategy) => strategy.mode === "PAPER" && strategy.enabled,
+      );
+      setSimulationStrategies(paperEnabled);
     } catch (err) {
       console.error("Falha ao carregar estratégias para simulação", err);
       setSimulationStrategies([]);
@@ -386,6 +438,24 @@ export default function DashboardPage() {
     await resetPaperEnvironment(token);
     await Promise.all([loadSimulationPaper(), loadSimulationControl()]);
   }, [loadSimulationControl, loadSimulationPaper]);
+
+  const handleSimulationLiquidation = useCallback(async (): Promise<SimulationUtilityResult> => {
+    const token = typeof window !== "undefined" ? localStorage.getItem("accessToken") : null;
+    if (!token) {
+      return { success: false, errorMessage: "Sessão expirada. Faça login novamente." };
+    }
+    try {
+      const result = await liquidatePaperPortfolio(token);
+      await loadSimulationPaper();
+      return {
+        success: true,
+        message: result.message || "Liquidação concluída.",
+      };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Falha ao liquidar posições paper.";
+      return { success: false, errorMessage: message };
+    }
+  }, [loadSimulationPaper]);
 
   useEffect(() => {
     const storedUser = localStorage.getItem("username");
@@ -548,6 +618,19 @@ export default function DashboardPage() {
     }
     void loadSimulationControl();
     void loadSimulationPaper();
+  }, [activeView, loadSimulationControl, loadSimulationPaper]);
+
+  useEffect(() => {
+    if (activeView !== "simulations") {
+      return;
+    }
+    const intervalId = window.setInterval(() => {
+      void loadSimulationControl();
+      void loadSimulationPaper();
+    }, 30_000);
+    return () => {
+      window.clearInterval(intervalId);
+    };
   }, [activeView, loadSimulationControl, loadSimulationPaper]);
 
   useEffect(() => {
@@ -749,11 +832,12 @@ const selectedStrategyDetails = useMemo(() => {
   const dashboardPortfolioProps = useMemo(
     () => ({
       positions: realPositions,
-      cash: { REAL: portfolio.cash?.REAL ?? "0", PAPER: "0" },
+      cash: { REAL: portfolio.cash?.REAL ?? "0", PAPER: portfolio.cash?.PAPER ?? "0" },
+      cashHistory: Array.isArray(portfolio.cash_history) ? portfolio.cash_history : [],
       loading,
       error: portfolioError,
     }),
-    [realPositions, portfolio.cash, loading, portfolioError]
+    [realPositions, portfolio.cash, portfolio.cash_history, loading, portfolioError]
   );
 
   const dashboardStrategiesProps = useMemo(
@@ -1170,7 +1254,7 @@ const selectedStrategyDetails = useMemo(() => {
   }
 
   return (
-    <div className={darkMode ? "dark" : ""}>
+    <div className={darkMode ? "dark theme-midnight" : ""}>
       <div className="flex min-h-screen w-full bg-slate-100 transition-colors dark:bg-slate-900">
         <div className="flex w-full flex-col gap-3 lg:flex-row lg:gap-4">
           <aside
@@ -1297,13 +1381,66 @@ const selectedStrategyDetails = useMemo(() => {
                   ) : (
                     <>
                       <MoonIcon className="h-4 w-4" />
-                      Modo escuro
+                      Modo escuro (Aurora)
                     </>
                   )}
                 </button>
                 <div className="flex items-center gap-2 rounded-full bg-slate-100 px-4 py-2 text-sm text-slate-600 dark:bg-slate-700 dark:text-slate-200">
                   <span className="h-2 w-2 rounded-full bg-emerald-500" />
                   Pipeline em execução
+                </div>
+                <div className="relative" ref={profileMenuRef}>
+                  <button
+                    type="button"
+                    onClick={() => setProfileMenuOpen((prev) => !prev)}
+                    className="flex items-center gap-3 rounded-full border border-slate-200 bg-white px-2 py-1 pr-4 text-sm font-semibold text-slate-700 shadow-sm transition hover:border-indigo-300 hover:text-indigo-600 dark:border-slate-600 dark:bg-slate-700 dark:text-slate-100 dark:hover:border-slate-500"
+                    aria-haspopup="menu"
+                    aria-expanded={profileMenuOpen}
+                  >
+                    <div className="flex h-10 w-10 items-center justify-center rounded-full bg-indigo-600 text-sm font-bold uppercase text-white">
+                      {profileInitials}
+                    </div>
+                    <div className="hidden text-left sm:block">
+                      <p className="text-xs text-slate-500 dark:text-slate-300">
+                        Sessão ativa
+                      </p>
+                      <p>{username}</p>
+                    </div>
+                    <ChevronDownIcon
+                      className={`h-4 w-4 text-slate-400 transition ${profileMenuOpen ? "rotate-180" : ""}`}
+                    />
+                  </button>
+                  {profileMenuOpen && (
+                    <div className="absolute right-0 z-20 mt-3 w-56 rounded-2xl border border-slate-200 bg-white p-4 text-sm shadow-2xl dark:border-slate-700 dark:bg-slate-800">
+                      <p className="text-xs uppercase tracking-wide text-slate-400 dark:text-slate-500">
+                        Perfil
+                      </p>
+                      <p className="mt-1 text-base font-semibold text-slate-900 dark:text-slate-100">
+                        {username}
+                      </p>
+                      <p className="text-xs text-slate-500 dark:text-slate-400">
+                        Configurações rápidas
+                      </p>
+                      <div className="mt-3 space-y-2">
+                        <button
+                          type="button"
+                          onClick={handleProfileSettingsClick}
+                          className="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-left font-medium text-slate-600 transition hover:bg-slate-100 dark:text-slate-200 dark:hover:bg-slate-700"
+                        >
+                          <CogIcon className="h-4 w-4" />
+                          Configurações de perfil
+                        </button>
+                        <button
+                          type="button"
+                          onClick={handleLogout}
+                          className="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-left font-medium text-rose-600 transition hover:bg-rose-50 dark:text-rose-300 dark:hover:bg-rose-900/40"
+                        >
+                          <LogoutIcon className="h-4 w-4" />
+                          Terminar sessão
+                        </button>
+                      </div>
+                    </div>
+                  )}
                 </div>
               </div>
             </header>
@@ -1931,10 +2068,16 @@ const selectedStrategyDetails = useMemo(() => {
                     onSubmit={handleSimulationSubmit}
                     onRefresh={handleSimulationRefresh}
                     onResetPaper={handleSimulationReset}
+                    onLiquidatePaper={handleSimulationLiquidation}
                   />
                 )}
                 {activeView === "metrics" && (
-                  <MetricsSection standalone={false} showBackLink={false} />
+                  <MetricsSection
+                    standalone={false}
+                    showBackLink={false}
+                    operations={realOperations}
+                    portfolio={portfolio}
+                  />
                 )}
                 {activeView === "settings" && (
                   <SettingsSection standalone={false} showBackLink={false} />
@@ -2672,6 +2815,43 @@ function CogIcon(props: React.SVGProps<SVGSVGElement>) {
         d="M10.4 2.6a1.6 1.6 0 0 1 3.2 0l.2 1.2c.1.5.5.9 1 .9l1.2.2a1.6 1.6 0 0 1 .9 2.7l-.9.9a1 1 0 0 0 0 1.4l.9.9a1.6 1.6 0 0 1-.9 2.7l-1.2.2c-.5.1-.9.5-1 .9l-.2 1.2a1.6 1.6 0 0 1-3.2 0l-.2-1.2c-.1-.5-.5-.9-1-.9l-1.2-.2a1.6 1.6 0 0 1-.9-2.7l.9-.9a1 1 0 0 0 0-1.4l-.9-.9a1.6 1.6 0 0 1 .9-2.7l1.2-.2c.5-.1.9-.5 1-.9l.2-1.2z"
       />
       <circle cx="12" cy="12" r="3" />
+    </svg>
+  );
+}
+
+function ChevronDownIcon(props: React.SVGProps<SVGSVGElement>) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.6"
+      width="20"
+      height="20"
+      {...props}
+    >
+      <path strokeLinecap="round" strokeLinejoin="round" d="M6 9l6 6 6-6" />
+    </svg>
+  );
+}
+
+function LogoutIcon(props: React.SVGProps<SVGSVGElement>) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.6"
+      width="20"
+      height="20"
+      {...props}
+    >
+      <path
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        d="M10 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v16a2 2 0 0 1-2 2h-4a2 2 0 0 1-2-2v-2"
+      />
+      <path strokeLinecap="round" strokeLinejoin="round" d="M14 12H3m0 0 3-3m-3 3 3 3" />
     </svg>
   );
 }

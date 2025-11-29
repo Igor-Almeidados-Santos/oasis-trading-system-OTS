@@ -25,7 +25,7 @@ pub mod contracts {
 }
 
 const ORDER_MANAGER_ADDR: &str = "http://[::1]:50052";
-const REDIS_ADDR: &str = "redis://127.0.0.1/";
+const REDIS_ADDR: &str = "redis://127.0.0.1:6379/0";
 
 // --- Definição dos Nossos Limites de Risco ---
 fn load_decimal_env(var: &str, default: &str) -> BigDecimal {
@@ -285,8 +285,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Conexão com o Redis (opcional para DEV)
     let use_redis = std::env::var("RISK_USE_REDIS").unwrap_or_else(|_| "1".into()) != "0";
     let redis_opt = if use_redis {
-        info!("A ligar-se ao Redis em {}...", REDIS_ADDR);
-        match redis::Client::open(REDIS_ADDR) {
+        let redis_addr = std::env::var("RISK_REDIS_ADDR")
+            .or_else(|_| std::env::var("REDIS_ADDR"))
+            .unwrap_or_else(|_| REDIS_ADDR.to_string());
+        info!("A ligar-se ao Redis em {}...", redis_addr);
+        match redis::Client::open(redis_addr.as_str()) {
             Ok(c) => match c.get_multiplexed_async_connection().await {
                 Ok(conn) => Some(Arc::new(Mutex::new(conn))),
                 Err(e) => {

@@ -109,6 +109,18 @@ export async function resetPaperEnvironment(token: string) {
   });
 }
 
+export async function liquidatePaperPortfolio(token: string) {
+  return request<{
+    message: string;
+    cash: string;
+    delta: string;
+    positions_cleared: number;
+    unpriced_symbols?: string[];
+  }>("/api/v1/paper/liquidate", token, {
+    method: "POST",
+  });
+}
+
 export async function setBotStatus(
   token: string,
   status: "START" | "STOP"

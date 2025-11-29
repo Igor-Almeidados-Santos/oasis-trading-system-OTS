@@ -1000,6 +1000,7 @@ func main() {
 		apiV1.POST("/bot/status", handler.setBotStatus)
 		apiV1.POST("/strategies/:strategy_id/toggle", handler.setStrategyConfig)
 		apiV1.POST("/paper/reset", handler.resetPaperEnvironment)
+		apiV1.POST("/paper/liquidate", handler.liquidatePaperPortfolio)
 	}
 
 	internal := router.Group("/internal/v1")
@@ -1167,6 +1168,133 @@ func (h *ApiHandler) resetPaperEnvironment(c *gin.Context) {
 	truncatePaperOperations(ctx, h.dbPool)
 
 	c.JSON(http.StatusOK, gin.H{"message": "Ambiente paper reinicializado"})
+}
+
+func (h *ApiHandler) liquidatePaperPortfolio(c *gin.Context) {
+	ctx := context.Background()
+	type redisPosition struct {
+		Symbol       string `json:"symbol"`
+		Quantity     string `json:"quantity"`
+		AveragePrice string `json:"average_price"`
+	}
+
+	iter := h.redisClient.Scan(ctx, 0, "position:paper:*", 0).Iterator()
+	var keysToDelete []string
+	var cleared []redisPosition
+	var recordedOps []Operation
+	var unpriced []string
+	totalValue := 0.0
+	now := time.Now().UTC()
+
+	for iter.Next(ctx) {
+		key := iter.Val()
+		payload, err := h.redisClient.Get(ctx, key).Result()
+		if err != nil {
+			log.Printf("Erro ao ler posição %s: %v", key, err)
+			continue
+		}
+		var rp redisPosition
+		if err := json.Unmarshal([]byte(payload), &rp); err != nil {
+			log.Printf("Erro ao interpretar posição %s: %v", key, err)
+			continue
+		}
+		keysToDelete = append(keysToDelete, key)
+		cleared = append(cleared, rp)
+
+		qty := parseDecimalString(rp.Quantity)
+		if qty <= 0 {
+			unpriced = append(unpriced, rp.Symbol)
+			continue
+		}
+		price := parseDecimalString(rp.AveragePrice)
+		if price <= 0 {
+			price = h.lookupFallbackPaperPrice(ctx, rp.Symbol)
+		}
+		if price <= 0 {
+			unpriced = append(unpriced, rp.Symbol)
+			continue
+		}
+		value := qty * price
+		totalValue += value
+
+		recordedOps = append(recordedOps, Operation{
+			ClientOrderID: fmt.Sprintf("paper-liquidation-%s-%d", strings.ToLower(rp.Symbol), now.UnixNano()),
+			Symbol:        rp.Symbol,
+			Side:          "SELL",
+			OrderType:     "MARKET",
+			Quantity:      formatDecimalString(qty),
+			Price:         formatDecimalString(price),
+			Status:        "FILLED",
+			ExecutedAt:    now,
+			Fee:           "0",
+			Mode:          "PAPER",
+			StrategyID:    "paper-liquidation",
+		})
+	}
+	if err := iter.Err(); err != nil {
+		log.Printf("Erro ao percorrer posições paper: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Falha ao consultar posições paper"})
+		return
+	}
+
+	if len(cleared) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Não há posições em PAPER para liquidar"})
+		return
+	}
+
+	if len(keysToDelete) > 0 {
+		if err := h.redisClient.Del(ctx, keysToDelete...).Err(); err != nil {
+			log.Printf("Erro ao remover posições paper após liquidação: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Falha ao limpar posições paper"})
+			return
+		}
+	}
+
+	currentCash := parseDecimalString(h.redisSafeGet(ctx, "wallet:paper:USD"))
+	newCash := currentCash + totalValue
+	if err := h.redisClient.Set(ctx, "wallet:paper:USD", formatDecimalString(newCash), 0).Err(); err != nil {
+		log.Printf("Erro ao atualizar caixa paper: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Falha ao atualizar caixa paper"})
+		return
+	}
+
+	snapshot := CashSnapshot{
+		Mode:      "PAPER",
+		Balance:   formatDecimalString(newCash),
+		Delta:     formatDecimalString(totalValue),
+		Timestamp: now,
+		Side:      "SELL",
+	}
+	if body, err := json.Marshal(snapshot); err == nil {
+		if err := h.redisClient.LPush(ctx, "wallet:paper:history", body).Err(); err != nil {
+			log.Printf("Aviso: falha ao atualizar histórico de caixa paper: %v", err)
+		}
+	}
+
+	insertedOps := 0
+	for _, op := range recordedOps {
+		if err := insertPaperOperation(ctx, h.dbPool, op); err != nil {
+			log.Printf("Falha ao registrar operação de liquidação %s: %v", op.Symbol, err)
+			continue
+		}
+		insertedOps++
+	}
+
+	message := fmt.Sprintf("Liquidação concluída: %d ativo(s) convertidos, variação %s.", len(cleared), formatDecimalString(totalValue))
+	if totalValue == 0 {
+		message = "Liquidação concluída, mas não foi possível estimar valor para as posições."
+	}
+	response := gin.H{
+		"message":             message,
+		"cash":                formatDecimalString(newCash),
+		"delta":               formatDecimalString(totalValue),
+		"positions_cleared":   len(cleared),
+		"operations_recorded": insertedOps,
+	}
+	if len(unpriced) > 0 {
+		response["unpriced_symbols"] = unpriced
+	}
+	c.JSON(http.StatusOK, response)
 }
 
 func (h *ApiHandler) getOperations(c *gin.Context) {
@@ -1431,6 +1559,48 @@ func truncatePaperOperations(ctx context.Context, pool *pgxpool.Pool) {
 	if _, err := pool.Exec(ctx, "TRUNCATE paper_operations RESTART IDENTITY"); err != nil {
 		log.Printf("Erro ao limpar paper_operations: %v", err)
 	}
+}
+
+func (h *ApiHandler) redisSafeGet(ctx context.Context, key string) string {
+	val, err := h.redisClient.Get(ctx, key).Result()
+	if err != nil {
+		return ""
+	}
+	return val
+}
+
+func parseDecimalString(value string) float64 {
+	clean := strings.TrimSpace(value)
+	if clean == "" {
+		return 0
+	}
+	clean = strings.ReplaceAll(clean, ",", "")
+	val, err := strconv.ParseFloat(clean, 64)
+	if err != nil {
+		return 0
+	}
+	return val
+}
+
+func formatDecimalString(value float64) string {
+	return strconv.FormatFloat(value, 'f', 8, 64)
+}
+
+func (h *ApiHandler) lookupFallbackPaperPrice(ctx context.Context, symbol string) float64 {
+	if h.dbPool == nil {
+		return 0
+	}
+	const query = `
+        SELECT price
+        FROM paper_operations
+        WHERE symbol = $1 AND side = 'BUY'
+        ORDER BY executed_at DESC
+        LIMIT 1`
+	var price string
+	if err := h.dbPool.QueryRow(ctx, query, symbol).Scan(&price); err != nil {
+		return 0
+	}
+	return parseDecimalString(price)
 }
 
 func (h *ApiHandler) authenticateFirebaseUser(ctx context.Context, username, password string) bool {

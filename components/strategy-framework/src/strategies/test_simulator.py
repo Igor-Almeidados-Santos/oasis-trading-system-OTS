@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
 import logging
 import math
+import random
 import time
+from dataclasses import dataclass
 from typing import Dict, Iterable, List
 
 from google.protobuf.timestamp_pb2 import Timestamp
@@ -48,6 +49,7 @@ class TestSimulatorStrategy(Strategy):
         self._min_notional_usd = 1.0
         self._last_price: Dict[str, float] = {symbol: 0.0 for symbol in self._symbols}
         self._max_order_notional = float(os.getenv("TEST_SIM_MAX_ORDER_USD", "25000"))
+        self._last_random_op_ts: float = 0.0
 
     # ------------------------------------------------------------------
     # Configuration helpers
@@ -141,17 +143,8 @@ class TestSimulatorStrategy(Strategy):
         now = time.time()
         self._last_price[symbol] = price
 
-        signals: List[actions_pb2.TradingSignal] = []
-        signals.extend(self._maybe_emit_for_symbol(symbol, price, now))
-
-        for other in sorted(self._symbols):
-            if other == symbol:
-                continue
-        fallback_price = self._last_price.get(other)
-        if fallback_price and fallback_price > 0:
-            signals.extend(self._maybe_emit_for_symbol(other, fallback_price, now))
-
-        return signals
+        random_signal = self._maybe_emit_random_operation(now)
+        return [random_signal] if random_signal else []
 
     # ------------------------------------------------------------------
     # Introspection helpers (for dashboard)
@@ -173,42 +166,43 @@ class TestSimulatorStrategy(Strategy):
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
-    def _maybe_emit_for_symbol(self, symbol: str, price: float, now: float) -> List[actions_pb2.TradingSignal]:
-        last_batch = self._last_batch_ts.get(symbol, 0.0)
-        if now - last_batch < self._parameters.batch_interval_seconds:
-            last_ts = self._last_action_ts.get(symbol, 0.0)
-            if now - last_ts < self._parameters.cooldown_seconds:
-                return []
-            signal = (
-                self._handle_buy(symbol, price)
-                if self._position_state.get(symbol, "FLAT") != "LONG"
-                else self._handle_sell(symbol, price)
-            )
-            if signal is None:
-                return []
-            self._last_action_ts[symbol] = now
-            return [signal]
+    def _maybe_emit_random_operation(self, now: float) -> actions_pb2.TradingSignal | None:
+        interval = self._parameters.batch_interval_seconds if self._parameters.batch_interval_seconds > 0 else 60.0
+        cooldown = self._parameters.cooldown_seconds if self._parameters.cooldown_seconds > 0 else 0.0
+        minimum_wait = max(interval, cooldown)
+        if now - self._last_random_op_ts < minimum_wait:
+            return None
+        if not self._symbols:
+            return None
 
-        signals: List[actions_pb2.TradingSignal] = []
-        state = self._position_state.get(symbol, "FLAT")
-        for _ in range(self._parameters.batch_size):
-            signal = self._handle_buy(symbol, price) if state != "LONG" else self._handle_sell(symbol, price)
-            if signal is None:
-                continue
-            signals.append(signal)
-            state = "LONG" if signal.side == "BUY" else "FLAT"
-        if signals:
-            self._position_state[symbol] = state
-            self._last_batch_ts[symbol] = now
-            self._last_action_ts[symbol] = now
-            log.info(
-                "[%s] Lote de %d ordens emitido para %s (intervalo %.0fs)",
-                self.strategy_id,
-                self._parameters.batch_size,
-                symbol,
-                self._parameters.batch_interval_seconds,
-            )
-        return signals
+        candidates = [symbol for symbol in self._symbols if self._last_price.get(symbol, 0.0) > 0]
+        if not candidates:
+            return None
+
+        target_symbol = random.choice(sorted(candidates))
+        side = random.choice(["BUY", "SELL"])
+
+        if side == "BUY" and self._cash_balance < self._min_notional_usd:
+            side = "SELL"
+        if side == "SELL" and self._positions_qty.get(target_symbol, 0.0) <= 0:
+            side = "BUY"
+
+        price = self._last_price.get(target_symbol, 0.0)
+        signal: actions_pb2.TradingSignal | None = None
+        if side == "BUY":
+            signal = self._execute_random_buy(target_symbol, price)
+        else:
+            signal = self._handle_sell(target_symbol, price)
+
+        if signal:
+            self._last_random_op_ts = now
+        return signal
+
+    def _execute_random_buy(self, symbol: str, price: float) -> actions_pb2.TradingSignal | None:
+        signal = self._handle_buy(symbol, price)
+        if signal:
+            log.info("[%s] Compra aleatória executada para %s.", self.strategy_id, symbol)
+        return signal
 
     def _handle_buy(self, symbol: str, price: float) -> actions_pb2.TradingSignal | None:
         quantity = self._calculate_buy_quantity(price)
@@ -234,7 +228,7 @@ class TestSimulatorStrategy(Strategy):
             price,
             self._cash_balance,
         )
-        return self._build_signal(symbol, "BUY", price, quantity)
+        return self._build_signal(symbol, "BUY", price, quantity, cash_spent=notional)
 
     def _handle_sell(self, symbol: str, price: float) -> actions_pb2.TradingSignal | None:
         quantity = self._positions_qty.get(symbol, 0.0)
@@ -258,16 +252,22 @@ class TestSimulatorStrategy(Strategy):
     def _calculate_buy_quantity(self, price: float) -> float:
         if price <= 0 or self._cash_balance <= 0:
             return 0.0
-        symbol_count = max(len(self._symbols), 1)
-        allocatable = self._cash_balance * self._parameters.position_size_pct
-        allocatable = allocatable / symbol_count
-        allocatable = min(allocatable, self._cash_balance, self._max_order_notional)
+        pct = max(min(self._parameters.position_size_pct, 1.0), 0.01)
+        allocatable = min(self._cash_balance * pct, self._cash_balance, self._max_order_notional)
         if allocatable < self._min_notional_usd:
             return 0.0
         quantity = allocatable / price
         return quantity if quantity > 0 else 0.0
 
-    def _build_signal(self, symbol: str, side: str, price: float, quantity: float) -> actions_pb2.TradingSignal:
+    def _build_signal(
+        self,
+        symbol: str,
+        side: str,
+        price: float,
+        quantity: float,
+        *,
+        cash_spent: float | None = None,
+    ) -> actions_pb2.TradingSignal:
         timestamp = Timestamp()
         timestamp.GetCurrentTime()
         notional = price * quantity
@@ -276,6 +276,8 @@ class TestSimulatorStrategy(Strategy):
             "quantity": f"{quantity:.10f}",
             "notional": f"{notional:.2f}",
         }
+        if cash_spent is not None:
+            metadata["cash_spent"] = f"{cash_spent:.2f}"
         return actions_pb2.TradingSignal(
             strategy_id=self.strategy_id,
             symbol=symbol,

@@ -668,10 +668,6 @@ async def wait_for_kafka_topic(consumer: Consumer, topic: str, attempts: int, ba
     return False
 
 
-if __name__ == "__main__":
-    asyncio.run(main())
-
-
 async def report_operation_to_control_center(
     order_request: actions_pb2.OrderRequest | None, signal: actions_pb2.TradingSignal
 ) -> None:
@@ -717,3 +713,7 @@ async def _post_internal_event(path: str, payload: dict) -> None:
         await asyncio.to_thread(_send)
     except urllib.error.URLError as err:
         log.debug("Falha ao enviar operação para Control Center: %s", err)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
