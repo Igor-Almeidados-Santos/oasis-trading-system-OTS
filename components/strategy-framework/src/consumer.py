@@ -65,6 +65,19 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0")
 STRATEGY_CONFIG_PREFIX = os.getenv("STRATEGY_CONFIG_KEY_PREFIX", "control:strategy:")
 CONTROL_CENTER_API_URL = os.getenv("CONTROL_CENTER_API_URL", "").rstrip("/")
 CONTROL_CENTER_INTERNAL_TOKEN = os.getenv("CONTROL_CENTER_INTERNAL_TOKEN", "")
+BOT_STATUS_KEY = os.getenv("BOT_STATUS_KEY", "control:bot_status")
+
+
+def _normalize_bot_status(value: str | None) -> str | None:
+    if not value:
+        return None
+    normalized = value.strip().upper()
+    if normalized in {"RUNNING", "STOPPED"}:
+        return normalized
+    return None
+
+
+DEFAULT_BOT_STATUS = _normalize_bot_status(os.getenv("DEFAULT_BOT_STATUS", "RUNNING")) or "RUNNING"
 
 # --- Métricas ---
 TRADES_PROCESSED = Counter("strategy_trades_processed_total", "Total de trades processados", ["symbol"])
@@ -76,7 +89,7 @@ SIGNAL_VALIDATION_RESULT = Counter(
 )
 
 # --- Estado Global do Bot ---
-bot_status = "STOPPED"
+bot_status = DEFAULT_BOT_STATUS
 active_strategies: Dict[str, Strategy] = {}
 strategy_configs: Dict[str, Dict[str, Any]] = {}
 redis_state_client: aioredis.Redis | None = None
@@ -184,6 +197,28 @@ async def apply_saved_strategy_config(redis_client: aioredis.Redis, strategy: St
         except Exception as err:  # noqa: BLE001
             log.warning("Falha ao atualizar estado enabled em %s: %s", redis_key, err)
     strategy.set_enabled(False)
+
+
+async def restore_bot_status(redis_client: aioredis.Redis | None) -> None:
+    """Restaura o estado RUNNING/STOPPED guardado pelo Control Center."""
+    global bot_status
+    if redis_client is None:
+        log.warning("Redis indisponível, mantendo estado do bot: %s", bot_status)
+        return
+    try:
+        stored_status = await redis_client.get(BOT_STATUS_KEY)
+    except Exception as err:  # noqa: BLE001
+        log.warning("Falha ao ler estado do bot no Redis: %s", err)
+        return
+    if stored_status is None:
+        log.info("Nenhum estado prévio do bot encontrado; a utilizar default: %s", bot_status)
+        return
+    normalized = _normalize_bot_status(stored_status)
+    if normalized is None:
+        log.warning("Valor inválido em %s (%s). Mantendo estado atual: %s", BOT_STATUS_KEY, stored_status, bot_status)
+        return
+    bot_status = normalized
+    log.info("Estado global do bot restaurado do Redis: %s", bot_status)
 
 
 async def consume_control_commands(command_consumer: Consumer) -> None:
@@ -520,6 +555,7 @@ async def main() -> None:
     try:
         redis_client = await aioredis.from_url(REDIS_URL, encoding="utf-8", decode_responses=True)
         redis_state_client = redis_client
+        await restore_bot_status(redis_client)
     except Exception as err:  # noqa: BLE001
         log.warning("Não foi possível conectar ao Redis (%s). Usando configurações padrão.", err)
 

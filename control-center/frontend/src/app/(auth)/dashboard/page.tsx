@@ -239,6 +239,12 @@ export default function DashboardPage() {
   const [simulationControlLoading, setSimulationControlLoading] = useState(false);
   const [simulationPaperState, setSimulationPaperState] = useState<PaperSimulationSnapshot | undefined>();
   const [simulationPaperLoading, setSimulationPaperLoading] = useState(false);
+  const sidebarGradient = useMemo(
+    () => "linear-gradient(165deg, #0a0712 0%, #141024 45%, #1d152f 100%)",
+    [],
+  );
+  const sidebarTextClass = "text-white";
+  const sidebarMutedText = "text-white/60";
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -466,6 +472,12 @@ export default function DashboardPage() {
     const storedTheme = localStorage.getItem("control-center-theme");
     if (storedTheme === "dark") {
       setDarkMode(true);
+    } else if (!storedTheme) {
+      const prefersDark =
+        typeof window !== "undefined" &&
+        window.matchMedia &&
+        window.matchMedia("(prefers-color-scheme: dark)").matches;
+      setDarkMode(prefersDark);
     }
 
     const storedView = localStorage.getItem("dashboard-active-view") as DashboardView | null;
@@ -487,6 +499,14 @@ export default function DashboardPage() {
 
   useEffect(() => {
     localStorage.setItem("control-center-theme", darkMode ? "dark" : "light");
+  }, [darkMode]);
+
+  useEffect(() => {
+    if (typeof document === "undefined") {
+      return;
+    }
+    document.body.dataset.theme = darkMode ? "dark" : "light";
+    document.body.classList.add("theme-shell");
   }, [darkMode]);
 
   useEffect(() => {
@@ -1255,12 +1275,16 @@ const selectedStrategyDetails = useMemo(() => {
 
   return (
     <div className={darkMode ? "dark theme-midnight" : ""}>
-      <div className="flex min-h-screen w-full bg-slate-100 transition-colors dark:bg-slate-900">
+      <div className="flex min-h-screen w-full bg-slate-100/60 transition-colors dark:bg-transparent">
         <div className="flex w-full flex-col gap-3 lg:flex-row lg:gap-4">
           <aside
-            className={`flex flex-shrink-0 flex-col justify-between bg-gradient-to-br from-[#191835] via-[#26264a] to-[#343466] text-white transition-all duration-300 ${
+            style={{
+              background: sidebarGradient,
+              boxShadow: "0 20px 50px rgba(67, 61, 107, 0.18)",
+            }}
+            className={`flex flex-shrink-0 flex-col justify-between rounded-r-3xl transition-all duration-300 ${
               sidebarCollapsed ? "w-[92px] p-5 items-center" : "w-64 p-6"
-            }`}
+            } ${sidebarTextClass}`}
           >
             <div className="w-full">
               <button
@@ -1278,12 +1302,14 @@ const selectedStrategyDetails = useMemo(() => {
 
               {!sidebarCollapsed && (
                 <div className="mb-10 flex items-center gap-3">
-                  <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-white/10 text-2xl font-semibold">
+                  <div
+                    className="flex h-12 w-12 items-center justify-center rounded-2xl bg-white/10 text-2xl font-semibold text-white"
+                  >
                     O
                   </div>
                   <div>
                     <p className="text-lg font-semibold">Oasis</p>
-                    <p className="text-sm text-white/60">Control Center</p>
+                    <p className={`text-sm ${sidebarMutedText}`}>Control Center</p>
                   </div>
                 </div>
               )}
@@ -1342,12 +1368,15 @@ const selectedStrategyDetails = useMemo(() => {
             </div>
 
             {!sidebarCollapsed && (
-              <div className="mt-6 bg-white/10 px-6 py-6">
+              <div
+                className="mt-6 rounded-2xl px-6 py-6"
+                style={{ background: "rgba(255,255,255,0.08)" }}
+              >
                 <p className="text-sm text-white/70">Gestão do Bot</p>
                 <p className="mt-2 text-lg font-semibold">
                   Status {summary.botStatus}
                 </p>
-                <p className="mt-3 text-xs text-white/60">
+                <p className={`mt-3 text-xs ${sidebarMutedText}`}>
                   Utilize o painel para alternar modos (REAL/PAPER) e pausar
                   estratégias em segundos.
                 </p>
@@ -1355,7 +1384,13 @@ const selectedStrategyDetails = useMemo(() => {
             )}
           </aside>
 
-          <main className="flex-1 space-y-5 bg-white px-6 py-8 shadow transition-colors dark:bg-slate-800">
+          <main
+            className="flex-1 space-y-5 rounded-l-3xl px-6 py-8 shadow transition-colors"
+            style={{
+              background: "var(--surface-1)",
+              color: "var(--text-strong)",
+            }}
+          >
             {activeView === "dashboard" ? (
               <>
             <header className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">

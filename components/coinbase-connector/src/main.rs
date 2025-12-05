@@ -3,12 +3,15 @@ mod schemas;
 use config::ConnectorConfig;
 use connector::CoinbaseConnector;
 use dotenv::dotenv;
+use redis::aio::ConnectionManager;
 use rdkafka::config::ClientConfig;
 use rdkafka::producer::FutureProducer;
 use rdkafka::producer::Producer; // para acessar producer.client()
+use tokio::sync::RwLock;
+use tokio::time::{interval, Duration, MissedTickBehavior};
 use tracing::info;
 use tracing::{error, warn};
-use std::time::Duration;
+use std::sync::Arc;
 
 mod config {
     use super::{DEFAULT_COINBASE_WS_URL, KAFKA_TOPIC};
@@ -39,6 +42,9 @@ mod config {
         pub kafka_brokers: String,
         pub max_messages: Option<usize>,
         pub reconnect: ReconnectPolicy,
+        pub redis_url: String,
+        pub products_key: String,
+        pub products_poll_interval: Duration,
     }
 
     impl ConnectorConfig {
@@ -50,12 +56,23 @@ mod config {
             let kafka_brokers =
                 env::var("KAFKA_BROKERS").unwrap_or_else(|_| "localhost:9092".to_string());
 
-            let product_ids = read_list_env("COINBASE_PRODUCT_IDS", &["BTC-USD", "ETH-USD"]);
+            let product_ids = read_list_env("COINBASE_PRODUCT_IDS", &["BTC-USD", "ETH-USD", "SOL-USD"]);
             let channels = read_list_env("COINBASE_CHANNELS", &["matches"]);
 
             let max_messages = env::var("CONNECTOR_MAX_MESSAGES")
                 .ok()
                 .and_then(|v| v.parse().ok());
+
+            let redis_url = env::var("REDIS_ADDR")
+                .or_else(|_| env::var("REDIS_URL"))
+                .unwrap_or_else(|_| "redis://127.0.0.1:6380/0".to_string());
+            let products_key =
+                env::var("CONNECTOR_PRODUCTS_KEY").unwrap_or_else(|_| "control:coinbase:products".into());
+            let products_poll_interval = env::var("CONNECTOR_PRODUCTS_POLL_MS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .map(Duration::from_millis)
+                .unwrap_or_else(|| Duration::from_millis(10_000));
 
             let reconnect = ReconnectPolicy {
                 initial_backoff: env::var("CONNECTOR_BACKOFF_INITIAL_MS")
@@ -78,6 +95,9 @@ mod config {
                 kafka_brokers,
                 max_messages,
                 reconnect,
+                redis_url,
+                products_key,
+                products_poll_interval,
             }
         }
     }
@@ -115,7 +135,10 @@ mod connector {
     use prost_types::Timestamp;
     use rdkafka::producer::{FutureProducer, FutureRecord};
     use serde::Deserialize;
-    use std::time::{Duration, SystemTime};
+    use std::sync::Arc;
+    use std::time::SystemTime;
+    use tokio::sync::RwLock;
+    use tokio::time::{interval, Duration, MissedTickBehavior};
     use thiserror::Error;
     use tokio::time::sleep;
     use tokio_tungstenite::{
@@ -132,17 +155,22 @@ mod connector {
     pub struct CoinbaseConnector {
         config: ConnectorConfig,
         producer: FutureProducer,
+        product_ids: Arc<RwLock<Vec<String>>>,
     }
 
     impl CoinbaseConnector {
-        pub fn new(config: ConnectorConfig, producer: FutureProducer) -> Self {
-            Self { config, producer }
+        pub fn new(
+            config: ConnectorConfig,
+            producer: FutureProducer,
+            product_ids: Arc<RwLock<Vec<String>>>,
+        ) -> Self {
+            Self { config, producer, product_ids }
         }
 
         pub async fn run(self) -> Result<(), ConnectorError> {
             info!(
                 ws_url = %self.config.ws_url,
-                product_ids = ?self.config.product_ids,
+                product_ids = ?*self.product_ids.read().await,
                 channels = ?self.config.channels,
                 "Inicializando ciclo principal do conector"
             );
@@ -175,60 +203,79 @@ mod connector {
 
             let (mut writer, mut reader) = ws_stream.split();
 
+            let subscribed_products = self.product_ids.read().await.clone();
             let subscribe_msg =
-                build_subscribe_message(&self.config.product_ids, &self.config.channels);
+                build_subscribe_message(&subscribed_products, &self.config.channels);
             writer.send(WsMessage::Text(subscribe_msg)).await?;
 
             let mut processed = 0usize;
-            while let Some(message) = reader.next().await {
-                match message {
-                    Ok(WsMessage::Text(text)) => match classify_message(&text)? {
-                        MessageKind::Trade(trade) => {
-                            self.publish_trade(&trade).await?;
-                            processed += 1;
-                            if let Some(limit) = self.config.max_messages {
-                                if processed >= limit {
-                                    info!(
-                                        limit,
-                                        "Limite de mensagens atingido, encerrando execução"
-                                    );
-                                    return Ok(LoopControl::Stop);
+            let mut product_watch = interval(Duration::from_secs(5));
+            product_watch.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = product_watch.tick() => {
+                        let latest = self.product_ids.read().await.clone();
+                        if latest != subscribed_products {
+                            info!(
+                                old = subscribed_products.len(),
+                                new = latest.len(),
+                                "Lista de produtos atualizada. Reinscrevendo WebSocket."
+                            );
+                            return Ok(LoopControl::Continue);
+                        }
+                    }
+                    message = reader.next() => {
+                        let Some(message) = message else { break; };
+                        match message {
+                            Ok(WsMessage::Text(text)) => match classify_message(&text)? {
+                                MessageKind::Trade(trade) => {
+                                    self.publish_trade(&trade).await?;
+                                    processed += 1;
+                                    if let Some(limit) = self.config.max_messages {
+                                        if processed >= limit {
+                                            info!(
+                                                limit,
+                                                "Limite de mensagens atingido, encerrando execução"
+                                            );
+                                            return Ok(LoopControl::Stop);
+                                        }
+                                    }
                                 }
+                                MessageKind::Error(reason) => {
+                                    warn!(%reason, "Feed retornou erro");
+                                    return Err(ConnectorError::Coinbase(reason));
+                                }
+                                MessageKind::Subscriptions => {
+                                    info!("Inscrição confirmada pelo feed da Coinbase");
+                                }
+                                MessageKind::Heartbeat => {
+                                    trace!("Heartbeat recebido");
+                                }
+                                MessageKind::Status => {
+                                    debug!("Mensagem de status recebida");
+                                }
+                                MessageKind::Unknown(kind) => {
+                                    trace!(kind = %kind, "Mensagem ignorada");
+                                }
+                            },
+                            Ok(WsMessage::Ping(payload)) => {
+                                writer.send(WsMessage::Pong(payload)).await?;
+                            }
+                            Ok(WsMessage::Pong(_)) => trace!("Pong recebido"),
+                            Ok(WsMessage::Close(frame)) => {
+                                info!(frame=?frame, "Socket fechado pelo servidor");
+                                return Ok(LoopControl::Continue);
+                            }
+                            Ok(WsMessage::Binary(_)) => {
+                                trace!("Mensagem binária ignorada");
+                            }
+                            Ok(WsMessage::Frame(_)) => {
+                                trace!("Frame interno ignorado");
+                            }
+                            Err(err) => {
+                                return Err(ConnectorError::Websocket(err));
                             }
                         }
-                        MessageKind::Error(reason) => {
-                            warn!(%reason, "Feed retornou erro");
-                            return Err(ConnectorError::Coinbase(reason));
-                        }
-                        MessageKind::Subscriptions => {
-                            info!("Inscrição confirmada pelo feed da Coinbase");
-                        }
-                        MessageKind::Heartbeat => {
-                            trace!("Heartbeat recebido");
-                        }
-                        MessageKind::Status => {
-                            debug!("Mensagem de status recebida");
-                        }
-                        MessageKind::Unknown(kind) => {
-                            trace!(kind = %kind, "Mensagem ignorada");
-                        }
-                    },
-                    Ok(WsMessage::Ping(payload)) => {
-                        writer.send(WsMessage::Pong(payload)).await?;
-                    }
-                    Ok(WsMessage::Pong(_)) => trace!("Pong recebido"),
-                    Ok(WsMessage::Close(frame)) => {
-                        info!(frame=?frame, "Socket fechado pelo servidor");
-                        return Ok(LoopControl::Continue);
-                    }
-                    Ok(WsMessage::Binary(_)) => {
-                        trace!("Mensagem binária ignorada");
-                    }
-                    Ok(WsMessage::Frame(_)) => {
-                        trace!("Frame interno ignorado");
-                    }
-                    Err(err) => {
-                        return Err(ConnectorError::Websocket(err));
                     }
                 }
             }
@@ -377,6 +424,106 @@ mod connector {
     }
 }
 
+fn parse_products(raw: &str) -> Vec<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return vec![];
+    }
+    if trimmed.starts_with('[') {
+        if let Ok(parsed) = serde_json::from_str::<Vec<String>>(trimmed) {
+            return normalize_symbols(parsed);
+        }
+    }
+    let split = trimmed
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .collect::<Vec<String>>();
+    normalize_symbols(split)
+}
+
+fn normalize_symbols(list: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    list.into_iter()
+        .filter_map(|s| {
+            let upper = s.trim().to_uppercase();
+            if upper.is_empty() {
+                return None;
+            }
+            if seen.insert(upper.clone()) {
+                Some(upper)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+async fn start_products_poll(
+    redis_url: String,
+    products_key: String,
+    products: Arc<RwLock<Vec<String>>>,
+    poll_interval: Duration,
+) {
+    let mut ticker = interval(poll_interval);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut conn: Option<ConnectionManager> = None;
+
+    loop {
+        ticker.tick().await;
+        if conn.is_none() {
+            match redis::Client::open(redis_url.as_str()) {
+                Ok(client) => match ConnectionManager::new(client).await {
+                    Ok(manager) => {
+                        conn = Some(manager);
+                        info!(key = %products_key, "Ligado ao Redis para sincronizar produtos do conector");
+                    }
+                    Err(err) => {
+                        warn!(error = %err, "Falha ao criar ConnectionManager para Redis");
+                        continue;
+                    }
+                },
+                Err(err) => {
+                    warn!(error = %err, url = %redis_url, "Não foi possível ligar ao Redis para sincronizar produtos; tentando novamente");
+                    continue;
+                }
+            }
+        }
+        let Some(manager) = conn.as_mut() else {
+            continue;
+        };
+
+        match redis::Cmd::get(&products_key)
+            .query_async::<_, Option<String>>(manager)
+            .await
+        {
+            Ok(Some(raw)) => {
+                let parsed = parse_products(&raw);
+                if parsed.is_empty() {
+                    continue;
+                }
+                let mut guard = products.write().await;
+                if *guard != parsed {
+                    let old_len = guard.len();
+                    *guard = parsed;
+                    info!(
+                        key = %products_key,
+                        old = old_len,
+                        new = guard.len(),
+                        "Lista de produtos atualizada via Redis"
+                    );
+                }
+            }
+            Ok(None) => {
+                // chave não existe; nada a fazer
+            }
+            Err(err) => {
+                warn!(error = %err, "Falha ao ler produtos do Redis");
+                conn = None;
+            }
+        }
+    }
+}
+
 const DEFAULT_COINBASE_WS_URL: &str = "wss://ws-feed.exchange.coinbase.com";
 const CONNECTOR_USER_AGENT: &str = "oasis-coinbase-connector/1.0";
 const KAFKA_TOPIC: &str = "market-data.trades.coinbase";
@@ -391,6 +538,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Iniciando Coinbase Connector...");
 
     let config = ConnectorConfig::from_env();
+    let shared_products = Arc::new(RwLock::new(config.product_ids.clone()));
+
+    tokio::spawn(start_products_poll(
+        config.redis_url.clone(),
+        config.products_key.clone(),
+        Arc::clone(&shared_products),
+        config.products_poll_interval,
+    ));
+
     let producer: FutureProducer = ClientConfig::new()
         .set("bootstrap.servers", &config.kafka_brokers)
         .set("message.timeout.ms", "5000")
@@ -420,7 +576,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("Kafka não disponível".into());
     }
 
-    let connector = CoinbaseConnector::new(config, producer);
+    let connector = CoinbaseConnector::new(config, producer, shared_products);
     connector.run().await?;
 
     Ok(())
@@ -457,7 +613,9 @@ mod tests {
     use super::*;
     use futures_util::{SinkExt, StreamExt};
     use std::io::ErrorKind;
+    use std::sync::Arc;
     use tokio::net::TcpListener;
+    use tokio::sync::RwLock;
     use tokio_tungstenite::{accept_async, tungstenite::protocol::Message as WsMessage};
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -497,6 +655,9 @@ mod tests {
             kafka_brokers: "localhost:9092".to_string(),
             max_messages: Some(1),
             reconnect: ReconnectPolicy::default(),
+            redis_url: "redis://127.0.0.1:6380/0".to_string(),
+            products_key: "control:coinbase:products".to_string(),
+            products_poll_interval: Duration::from_millis(10_000),
         };
 
         let producer: FutureProducer = ClientConfig::new()
@@ -505,7 +666,8 @@ mod tests {
             .create()
             .expect("falha ao criar FutureProducer");
 
-        let connector = CoinbaseConnector::new(config, producer);
+        let products = Arc::new(RwLock::new(config.product_ids.clone()));
+        let connector = CoinbaseConnector::new(config, producer, products);
         let res = connector.run().await;
 
         let _ = server.await;

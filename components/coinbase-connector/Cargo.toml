@@ -21,3 +21,4 @@ dotenv = "0.15.0"
 chrono = { version = "0.4", features = ["clock"] }
 http = "0.2"
 thiserror = "1.0"
+redis = { version = "0.24", features = ["aio", "tokio-comp", "connection-manager"] }

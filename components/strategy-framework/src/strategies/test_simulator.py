@@ -170,6 +170,9 @@ class TestSimulatorStrategy(Strategy):
         interval = self._parameters.batch_interval_seconds if self._parameters.batch_interval_seconds > 0 else 60.0
         cooldown = self._parameters.cooldown_seconds if self._parameters.cooldown_seconds > 0 else 0.0
         minimum_wait = max(interval, cooldown)
+        if self._last_random_op_ts == 0.0:
+            # Garante que a primeira operação não espere o intervalo completo
+            self._last_random_op_ts = now - minimum_wait
         if now - self._last_random_op_ts < minimum_wait:
             return None
         if not self._symbols:

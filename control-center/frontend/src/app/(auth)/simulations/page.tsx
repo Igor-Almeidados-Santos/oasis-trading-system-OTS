@@ -22,8 +22,15 @@ export default function SimulationsPage() {
   const [controlLoading, setControlLoading] = useState(true);
   const [paperState, setPaperState] = useState<PaperSimulationSnapshot | undefined>();
   const [paperLoading, setPaperLoading] = useState(true);
+  const [token, setToken] = useState<string | null>(null);
 
-  const token = useMemo(() => (typeof window !== "undefined" ? localStorage.getItem("accessToken") : null), []);
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    const stored = localStorage.getItem("accessToken");
+    setToken(stored);
+  }, []);
 
   const loadControlState = useCallback(async () => {
     if (!token) {
@@ -73,6 +80,18 @@ export default function SimulationsPage() {
       void loadPaperSnapshot();
     }
   }, [token, loadPaperSnapshot]);
+
+  // Atualiza snapshot periodicamente para refletir novas operações/gráficos
+  useEffect(() => {
+    if (!token) {
+      return undefined;
+    }
+    const intervalId = window.setInterval(() => {
+      void loadPaperSnapshot();
+      void loadControlState();
+    }, 4000);
+    return () => window.clearInterval(intervalId);
+  }, [token, loadPaperSnapshot, loadControlState]);
 
   const handleSubmit = useCallback(
     async (strategyId: string, payload: StrategyConfigUpdatePayload): Promise<SimulationActionResult> => {

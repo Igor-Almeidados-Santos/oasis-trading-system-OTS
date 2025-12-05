@@ -25,7 +25,8 @@ pub mod contracts {
 }
 
 const ORDER_MANAGER_ADDR: &str = "http://[::1]:50052";
-const REDIS_ADDR: &str = "redis://127.0.0.1:6379/0";
+// Ajuste o default do Redis para alinhar com o restante do stack (porta 6380 no docker-compose)
+const REDIS_ADDR: &str = "redis://127.0.0.1:6380/0";
 
 // --- Definição dos Nossos Limites de Risco ---
 fn load_decimal_env(var: &str, default: &str) -> BigDecimal {
