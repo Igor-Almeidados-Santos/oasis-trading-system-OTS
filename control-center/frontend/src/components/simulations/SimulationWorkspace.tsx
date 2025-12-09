@@ -342,17 +342,33 @@ export function SimulationWorkspace({
     }
   };
   const summary = useMemo(() => {
-    const fallbackCash = parseCurrency(formValues.usd_balance) ?? parseCurrency(currentStrategy?.usd_balance) ?? 0;
-    const latestPoint = performanceSeries[performanceSeries.length - 1];
-    const initialPoint = performanceSeries[0];
-    const latest = latestPoint ? latestPoint.equity : fallbackCash;
-    const initial = initialPoint ? initialPoint.equity : fallbackCash;
-    const pnl = latest - initial;
+    const currentCash = parseCurrency(effectivePaperState?.cash?.PAPER);
+    const configuredCash =
+      parseCurrency(formValues.usd_balance) ||
+      parseCurrency(currentStrategy?.usd_balance) ||
+      0;
+    const initialCash = configuredCash || currentCash;
+    const netCashImpact = historicalOperations.reduce((acc, op) => {
+      if ((op.mode ?? "").toUpperCase() !== "PAPER") {
+        return acc;
+      }
+      const price = parseCurrency(op.price);
+      const qty = parseCurrency(op.quantity);
+      const notional = price * qty;
+      const isBuy = (op.side ?? "").toUpperCase() === "BUY";
+      return acc + (isBuy ? -notional : notional);
+    }, 0);
+    const equity = Number.isFinite(currentCash) && currentCash !== 0 ? currentCash : initialCash + netCashImpact;
+    const variation = equity - initialCash;
+    const variationPct = initialCash > 0 ? (variation / initialCash) * 100 : 0;
+
     return {
-      cashDisplay: formatUsd(latest),
-      cashValue: latest,
-      pnlDisplay: pnl >= 0 ? `+${formatUsd(pnl)}` : formatUsd(pnl),
-      pnlValue: pnl,
+      equityDisplay: formatUsd(equity),
+      equityValue: equity,
+      pnlDisplay: variation >= 0 ? `+${formatUsd(variation)}` : formatUsd(variation),
+      pnlValue: variation,
+      pnlPctDisplay: `${variation >= 0 ? "+" : ""}${variationPct.toFixed(2)}%`,
+      pnlPositive: variation >= 0,
       realizedDisplay:
         realizedStats.pnl >= 0 ? `+${formatUsd(realizedStats.pnl)}` : formatUsd(realizedStats.pnl),
       realizedValue: realizedStats.pnl,
@@ -361,7 +377,7 @@ export function SimulationWorkspace({
       winRate: realizedStats.totalTrades > 0 ? realizedStats.wins / realizedStats.totalTrades : 0,
       totalTrades: realizedStats.totalTrades,
     };
-  }, [performanceSeries, formValues, currentStrategy, realizedStats]);
+  }, [formValues, currentStrategy, effectivePaperState, historicalOperations, realizedStats]);
 
   if (!hasStrategies) {
     return (
@@ -453,8 +469,14 @@ export function SimulationWorkspace({
       </header>
 
       <section className="grid gap-4 border border-slate-200 bg-white p-6 shadow-sm dark:border-slate-700 dark:bg-slate-800 sm:grid-cols-2 lg:grid-cols-4">
-        <SummaryTile label="Equity atual">{summary.cashDisplay}</SummaryTile>
-        <SummaryTile label="Variação de capital">{summary.pnlDisplay}</SummaryTile>
+        <SummaryTile label="Equity atual">{summary.equityDisplay}</SummaryTile>
+        <SummaryTile
+          label="Variação de capital"
+          meta={summary.pnlPctDisplay}
+          positive={summary.pnlPositive}
+        >
+          {summary.pnlDisplay}
+        </SummaryTile>
         <SummaryTile label="PnL realizado">{summary.realizedDisplay}</SummaryTile>
         <SummaryTile label="Vitórias / Derrotas">
           {summary.winners}/{summary.losers}
@@ -2224,13 +2246,34 @@ const renderEquityDot = (props: { cx?: number; cy?: number; payload?: Performanc
   );
 };
 
-function SummaryTile({ label, children }: { label: string; children: React.ReactNode }) {
+function SummaryTile({
+  label,
+  children,
+  meta,
+  positive,
+}: {
+  label: string;
+  children: React.ReactNode;
+  meta?: string;
+  positive?: boolean;
+}) {
   return (
     <div className="rounded-xl border border-slate-200 bg-slate-50 p-4 shadow-sm dark:border-slate-700 dark:bg-slate-900/40">
       <p className="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
         {label}
       </p>
-      <p className="mt-2 text-xl font-semibold text-slate-900 dark:text-white">{children}</p>
+      <div className="mt-2 flex items-baseline gap-2">
+        <p className="text-xl font-semibold text-slate-900 dark:text-white">{children}</p>
+        {meta && (
+          <span
+            className={`text-xs font-semibold ${
+              positive ? "text-emerald-600" : "text-rose-500"
+            }`}
+          >
+            {meta}
+          </span>
+        )}
+      </div>
     </div>
   );
 }

@@ -36,6 +36,22 @@ var (
         },
         []string{"variant", "mode", "outcome"},
     )
+
+    omPollCycles = promauto.NewCounterVec(
+        prometheus.CounterOpts{
+            Name: "order_manager_status_poll_cycles_total",
+            Help: "Total de ciclos do poller de status",
+        },
+        []string{"outcome"},
+    )
+
+    omPollFills = promauto.NewCounterVec(
+        prometheus.CounterOpts{
+            Name: "order_manager_status_poll_fills_total",
+            Help: "Total de fills aplicados via poller",
+        },
+        []string{"mode"},
+    )
 )
 
 func startMetricsServer() {
@@ -56,4 +72,3 @@ func startMetricsServer() {
         }
     }()
 }
-

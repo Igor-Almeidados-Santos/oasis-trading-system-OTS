@@ -773,6 +773,23 @@ var (
 	placeholderPasswordHash []byte
 )
 
+// requireSecret aborta o processo se a variável não for fornecida ou se usar valores fracos/placeholder.
+func requireSecret(key string, minLen int, disallow ...string) string {
+	val := strings.TrimSpace(os.Getenv(key))
+	if val == "" {
+		log.Fatalf("Configuração insegura: %s não definido", key)
+	}
+	if len(val) < minLen {
+		log.Fatalf("Configuração insegura: %s deve ter pelo menos %d caracteres", key, minLen)
+	}
+	for _, d := range disallow {
+		if val == d {
+			log.Fatalf("Configuração insegura: %s não pode ser '%s'", key, d)
+		}
+	}
+	return val
+}
+
 func generateJWT(username string) (string, error) {
 	claims := jwtClaims{
 		Username: username,
@@ -828,23 +845,12 @@ func main() {
 		log.Println("Atenção: Ficheiro .env não encontrado.")
 	}
 
-	jwtSecret := os.Getenv("JWT_SECRET")
-	if jwtSecret == "" {
-		log.Println("Atenção: Variável de ambiente JWT_SECRET não definida, a usar valor temporário 'dev-secret'.")
-		jwtSecret = "dev-secret"
-	}
+	jwtSecret := requireSecret("JWT_SECRET", 16, "dev-secret")
 	jwtSecretKey = []byte(jwtSecret)
 
-	placeholderUser = os.Getenv("CONTROL_CENTER_API_USER")
-	if placeholderUser == "" {
-		placeholderUser = "admin"
-	}
+	placeholderUser = requireSecret("CONTROL_CENTER_API_USER", 3, "admin")
 
-	rawPassword := os.Getenv("CONTROL_CENTER_API_PASSWORD")
-	if rawPassword == "" {
-		log.Println("Atenção: CONTROL_CENTER_API_PASSWORD não definido, a usar 'changeme'.")
-		rawPassword = "changeme"
-	}
+	rawPassword := requireSecret("CONTROL_CENTER_API_PASSWORD", 10, "changeme")
 
 	var err error
 	placeholderPasswordHash, err = bcrypt.GenerateFromPassword([]byte(rawPassword), bcrypt.DefaultCost)
@@ -911,11 +917,7 @@ func main() {
 		dbPool:      dbPool,
 		kafkaWriter: kafkaWriter,
 	}
-	internalToken := os.Getenv("CONTROL_CENTER_INTERNAL_TOKEN")
-	if internalToken == "" {
-		internalToken = "dev-internal-token"
-	}
-	handler.internalToken = internalToken
+		handler.internalToken = requireSecret("CONTROL_CENTER_INTERNAL_TOKEN", 16, "dev-internal-token")
 
 	if fbClient, err := newFirebaseClientFromEnv(); err != nil {
 		log.Printf("Aviso: falha ao configurar Firebase: %v", err)
@@ -936,13 +938,11 @@ func main() {
 
 	router := gin.Default()
 
-	corsOrigins := strings.Split(os.Getenv("CONTROL_CENTER_ALLOWED_ORIGINS"), ",")
-	if len(corsOrigins) == 1 && corsOrigins[0] == "" {
-		corsOrigins = []string{
-			"http://localhost:3000",
-			"http://localhost:3001",
-		}
+	rawOrigins := strings.TrimSpace(os.Getenv("CONTROL_CENTER_ALLOWED_ORIGINS"))
+	if rawOrigins == "" {
+		log.Fatalf("Configuração insegura: defina CONTROL_CENTER_ALLOWED_ORIGINS (lista separada por vírgulas)")
 	}
+	corsOrigins := strings.Split(rawOrigins, ",")
 	router.Use(cors.New(cors.Config{
 		AllowOrigins:     corsOrigins,
 		AllowMethods:     []string{"GET", "POST", "OPTIONS"},
@@ -1075,6 +1075,38 @@ func (h *ApiHandler) getPortfolio(c *gin.Context) {
 		}
 	}
 
+	// Fallback: mescla posições persistidas em positions_state (DB) caso Redis esteja incompleto
+	if h.dbPool != nil {
+		rows, err := h.dbPool.Query(ctx, `SELECT symbol, mode, quantity, average_price FROM positions_state`)
+		if err != nil {
+			log.Printf("Aviso: falha ao ler positions_state: %v", err)
+		} else {
+			defer rows.Close()
+			index := make(map[string]int)
+			for i, p := range positions {
+				index[p.Symbol+"|"+p.Mode] = i
+			}
+			for rows.Next() {
+				var symbol, mode, qty, avg string
+				if err := rows.Scan(&symbol, &mode, &qty, &avg); err != nil {
+					continue
+				}
+				key := symbol + "|" + strings.ToUpper(mode)
+				if idx, ok := index[key]; ok {
+					positions[idx].Quantity = qty
+					positions[idx].AveragePrice = avg
+				} else {
+					positions = append(positions, Position{
+						Symbol:       symbol,
+						Quantity:     qty,
+						AveragePrice: avg,
+						Mode:         strings.ToUpper(mode),
+					})
+				}
+			}
+		}
+	}
+
 	cashBalances := make(map[string]string)
 	if cashPaper, err := h.redisClient.Get(ctx, "wallet:paper:USD").Result(); err == nil && cashPaper != "" {
 		cashBalances["PAPER"] = cashPaper
@@ -1154,15 +1186,18 @@ func (h *ApiHandler) resetPaperEnvironment(c *gin.Context) {
 
 	if h.dbPool != nil {
 		if _, err := h.dbPool.Exec(ctx, `
-            WITH staged AS (
-                SELECT id FROM orders WHERE mode = 'PAPER'
-            )
+	        WITH staged AS (
+	            SELECT id FROM orders WHERE mode = 'PAPER'
+	        )
             DELETE FROM fills
-            WHERE order_id IN (SELECT id FROM staged)`); err != nil {
+	            WHERE order_id IN (SELECT id FROM staged)`); err != nil {
 			log.Printf("Erro ao limpar fills paper: %v", err)
 		}
 		if _, err := h.dbPool.Exec(ctx, `DELETE FROM orders WHERE mode = 'PAPER'`); err != nil {
 			log.Printf("Erro ao limpar ordens paper: %v", err)
+		}
+		if _, err := h.dbPool.Exec(ctx, `DELETE FROM positions_state WHERE mode = 'PAPER'`); err != nil {
+			log.Printf("Erro ao limpar positions_state paper: %v", err)
 		}
 	}
 	truncatePaperOperations(ctx, h.dbPool)
